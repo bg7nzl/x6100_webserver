@@ -4,6 +4,9 @@ import json
 import os
 import pathlib
 import subprocess
+import stat
+import time
+from urllib.parse import quote, urlparse
 
 import bottle
 
@@ -17,6 +20,53 @@ bottle.TEMPLATE_PATH += [
 ]
 
 STATIC_PATH = resources.files('x6100_webserver').joinpath('static')
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+_TXT_EXT = ".txt"
+
+
+def _normalize_txt_for_save(text: str) -> bytes:
+    """Normalize to ASCII (strip non-ASCII) and Linux line endings (\\n only)."""
+    # Linux line endings: no \\r\\n or \\r
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    # ASCII only: replace non-ASCII with space
+    s = "".join(c if ord(c) < 128 else " " for c in s)
+    return s.encode("ascii")
+
+
+def _url_quote_path(path: str) -> str:
+    return quote(path or "", safe="/")
+
+
+def _filebrowser_root() -> pathlib.Path:
+    root = pathlib.Path(settings.FILEBROWSER_PATH or "/")
+    try:
+        return root.resolve()
+    except Exception:
+        return root
+
+
+def _filebrowser_default_start() -> str:
+    """相对 root 的默认起始目录，空表示直接显示 root。"""
+    return getattr(settings, "FILEBROWSER_DEFAULT_START", "mnt") or ""
+
+
+def _resolve_filebrowser_path(filepath: str) -> pathlib.Path:
+    rel = (filepath or "").lstrip("/")
+    root = _filebrowser_root()
+    try:
+        candidate = (root / rel).resolve()
+    except Exception:
+        candidate = root / rel
+
+    # Prevent directory traversal when FILEBROWSER_PATH is not '/'.
+    try:
+        candidate.relative_to(root)
+    except Exception:
+        bottle.abort(403, "forbidden")
+
+    return candidate
 
 
 # Bands API
@@ -132,21 +182,272 @@ def digital_modes():
 @app.route('/files/<filepath:path>')
 @app.route('/files/<filepath:path>/')
 def files(filepath=""):
-    path = pathlib.Path(settings.FILEBROWSER_PATH) / filepath
+    root = _filebrowser_root()
+    path = _resolve_filebrowser_path(filepath)
+    # 默认起始目录：在根且未从子目录点「..」进来时，重定向到 /mnt
+    default_start = _filebrowser_default_start()
+    if default_start and path == root:
+        ref = bottle.request.get_header("Referer")
+        ref_path = urlparse(ref).path if ref else ""
+        # 来自 /files/xxx/ 表示点了「..」到根，不重定向
+        from_root = ref_path.startswith("/files/") and ref_path.rstrip("/").count("/") >= 2
+        if not from_root:
+            return bottle.redirect(f"/files/{_url_quote_path(default_start)}/")
     if path.is_file():
         os.sync()
-        response = bottle.static_file(str(path.relative_to(settings.FILEBROWSER_PATH)), root=settings.FILEBROWSER_PATH, download=True)
+        response = bottle.static_file(
+            str(path.relative_to(root)),
+            root=str(root),
+            download=True,
+        )
         response.set_header("Cache-Control", "private, no-cache, no-store")
         return response
-    else:
-        dirs = []
-        files = []
+
+    if not path.exists():
+        bottle.abort(404, "not found")
+    if not path.is_dir():
+        bottle.abort(404, "not found")
+
+    try:
+        rel_dir = path.relative_to(root)
+    except Exception:
+        rel_dir = pathlib.Path("")
+
+    # 上一层：不在根目录时显示 ..
+    has_parent = str(rel_dir) not in ("", ".")
+    parent_path = ""
+    if has_parent:
+        parent_rel = rel_dir.parent
+        parent_path = "" if str(parent_rel) == "." else parent_rel.as_posix()
+
+    dirs = []
+    files = []
+    try:
         for item in sorted(path.iterdir()):
+            item_rel = item.relative_to(root).as_posix()
+            entry = {"name": item.name, "path": item_rel, "path_url": _url_quote_path(item_rel)}
             if item.is_dir():
-                dirs.append(item.relative_to(path))
+                dirs.append(entry)
             else:
-                files.append(item.relative_to(path))
-        return bottle.template('files', dirs=dirs, files=files)
+                files.append(entry)
+    except PermissionError:
+        bottle.abort(403, "forbidden")
+
+    return bottle.template(
+        'files',
+        has_parent=has_parent,
+        parent_path=parent_path,
+        parent_path_url=_url_quote_path(parent_path),
+        dirs=dirs,
+        files=files,
+    )
+
+
+@app.route('/raw/<filepath:path>')
+def file_raw(filepath=""):
+    root = _filebrowser_root()
+    path = _resolve_filebrowser_path(filepath)
+    if not path.exists() or not path.is_file():
+        bottle.abort(404, "not found")
+    response = bottle.static_file(
+        str(path.relative_to(root)),
+        root=str(root),
+        download=False,
+    )
+    response.set_header("Cache-Control", "private, no-cache, no-store")
+    return response
+
+
+@app.route('/view/<filepath:path>')
+def file_view(filepath=""):
+    path = _resolve_filebrowser_path(filepath)
+    if not path.exists():
+        bottle.abort(404, "not found")
+    if path.is_dir():
+        return bottle.redirect(f"/files/{_url_quote_path(filepath)}/")
+
+    suffix = path.suffix.lower()
+    if suffix in _IMAGE_EXTS:
+        return bottle.template(
+            'file_view',
+            filepath=filepath,
+            filepath_url=_url_quote_path(filepath),
+            is_image=True,
+            image_url=f"/raw/{_url_quote_path(filepath)}",
+            text_content="",
+            truncated=False,
+            is_txt_editable=False,
+        )
+
+    max_bytes = 512 * 1024
+    truncated = False
+    try:
+        with path.open("rb") as f:
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            data = data[:max_bytes]
+            truncated = True
+        text_content = data.decode("utf-8", errors="replace")
+    except Exception as e:
+        text_content = f"[error reading file: {e}]"
+
+    # Only allow editing .txt when not truncated (avoid partial overwrite).
+    is_txt_editable = suffix == _TXT_EXT and not truncated
+    return bottle.template(
+        'file_view',
+        filepath=filepath,
+        filepath_url=_url_quote_path(filepath),
+        is_image=False,
+        image_url="",
+        text_content=text_content,
+        truncated=truncated,
+        is_txt_editable=is_txt_editable,
+    )
+
+
+@app.post('/api/save_txt/<filepath:path>')
+def save_txt(filepath=""):
+    """Save .txt file: ASCII only, Linux line endings (\\n)."""
+    path = _resolve_filebrowser_path(filepath)
+    if not path.exists() or not path.is_file():
+        bottle.abort(404, "not found")
+    if path.suffix.lower() != _TXT_EXT:
+        bottle.response.status = 400
+        return {"status": "error", "msg": "only .txt files can be saved"}
+    try:
+        body = bottle.request.body.read()
+        text = body.decode("utf-8", errors="replace")
+    except Exception as e:
+        bottle.response.status = 400
+        return {"status": "error", "msg": f"invalid request body: {e}"}
+    try:
+        data = _normalize_txt_for_save(text)
+        path.write_bytes(data)
+    except PermissionError:
+        bottle.response.status = 403
+        return {"status": "error", "msg": "permission denied"}
+    except Exception as e:
+        bottle.response.status = 500
+        return {"status": "error", "msg": str(e)}
+    return {"status": "OK"}
+
+
+# Remote control routes
+
+@app.route('/remote')
+def remote():
+    return bottle.template('remote')
+
+
+@app.route('/dmesg')
+def dmesg_view():
+    lines = []
+    error = ""
+    try:
+        # Keep it simple for BusyBox environments (no GNU-only flags).
+        cp = subprocess.run(["dmesg"], capture_output=True, text=True)
+        if cp.returncode != 0:
+            error = (cp.stderr or "").strip() or f"dmesg exited with code {cp.returncode}"
+        else:
+            all_lines = (cp.stdout or "").splitlines()
+            lines = all_lines[-200:]
+    except Exception as e:
+        error = str(e)
+
+    return bottle.template('dmesg', lines=lines, error=error)
+
+
+@app.get('/api/remote_screen')
+def remote_screen():
+    # Signal GUI to capture a screenshot on-demand.
+    req_path = pathlib.Path("/tmp/remote_screen.req")
+    try:
+        req_path.touch()
+    except Exception:
+        pass
+
+    # Best-effort wait: the screenshot is produced asynchronously.
+    # Since refresh is manual, it's OK to wait a short time here.
+    try:
+        req_mtime = req_path.stat().st_mtime
+    except Exception:
+        req_mtime = None
+
+    path = pathlib.Path(settings.REMOTE_SCREEN_PATH)
+    # 800x480 encode is slow on device; wait longer to reduce 503
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        try:
+            st = path.stat()
+            if st.st_size > 0 and (req_mtime is None or st.st_mtime >= req_mtime):
+                break
+        except FileNotFoundError:
+            pass
+        time.sleep(0.05)
+    # Only serve if we have a screenshot that was updated after this request.
+    # Otherwise we would return the previous screenshot when the GUI is slow.
+    try:
+        st = path.stat()
+        if st.st_size == 0 or (req_mtime is not None and st.st_mtime < req_mtime):
+            bottle.response.status = 503
+            return {"status": "error", "msg": "screen not ready, please try again"}
+    except FileNotFoundError:
+        bottle.response.status = 404
+        return {"status": "error", "msg": "screen not ready"}
+
+    response = bottle.static_file(path.name, root=str(path.parent))
+    response.set_header("Content-Type", "image/jpeg")
+    response.set_header("Cache-Control", "no-store, no-cache, must-revalidate")
+    response.set_header("Pragma", "no-cache")
+    return response
+
+
+def _write_remote_command(line):
+    fifo_path = pathlib.Path(settings.REMOTE_INPUT_PATH)
+    try:
+        if fifo_path.exists() and not stat.S_ISFIFO(fifo_path.stat().st_mode):
+            fifo_path.unlink()
+        if not fifo_path.exists():
+            os.mkfifo(fifo_path, 0o666)
+    except Exception:
+        pass
+
+    try:
+        fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError as e:
+        bottle.response.status = 503
+        return {"status": "error", "msg": f"remote control unavailable: {e}"}
+
+    return {"status": "OK"}
+
+
+@app.post('/api/remote_input')
+def remote_input():
+    data = bottle.request.json or {}
+    cmd_type = (data.get("type") or "").lower()
+    name = (data.get("name") or "").upper()
+
+    if cmd_type == "key":
+        action = (data.get("action") or "click").lower()
+        return _write_remote_command(f"KEY {name} {action}")
+
+    if cmd_type == "knob":
+        delta = data.get("delta")
+        if delta is None:
+            bottle.response.status = 400
+            return {"status": "error", "msg": "delta is required"}
+        return _write_remote_command(f"KNOB {name} {delta}")
+
+    if cmd_type == "knob_press":
+        action = (data.get("action") or "click").lower()
+        return _write_remote_command(f"KNOB_PRESS {name} {action}")
+
+    bottle.response.status = 400
+    return {"status": "error", "msg": "unknown type"}
 
 # Timezone routes
 

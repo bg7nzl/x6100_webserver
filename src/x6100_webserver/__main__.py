@@ -13,7 +13,7 @@ def run():
     parser.add_argument("--host", help="ip address to listen", default="localhost")
     parser.add_argument("--port", type=int, help="port to listen", default=8080)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--filebrowser-path", help="path file browser root", default="/mnt")
+    parser.add_argument("--filebrowser-path", help="path file browser root", default="/")
     args = parser.parse_args()
     plugin = bottle.ext.sqlite.Plugin(dbfile=args.db, keyword="dbcon")
     apps.app.install(plugin)
