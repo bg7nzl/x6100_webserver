@@ -178,6 +178,7 @@ def digital_modes():
     return bottle.template('digital_modes')
 
 
+@app.route('/files')
 @app.route('/files/')
 @app.route('/files/<filepath:path>')
 @app.route('/files/<filepath:path>/')
