@@ -3,6 +3,7 @@ from importlib import resources
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import stat
 import time
@@ -10,6 +11,7 @@ from urllib.parse import quote, urlparse
 
 import bottle
 
+from . import adif_parse
 from . import models
 from . import settings
 
@@ -456,6 +458,161 @@ def remote_input():
 @app.route('/time')
 def time_editor():
     return bottle.template('time')
+
+
+# Logbook routes
+
+
+def _gui_service(action: str) -> None:
+    """Run S95gui start|stop. Runtime only; does not change boot autostart."""
+    script = getattr(settings, "GUI_INIT_SCRIPT", "/etc/init.d/S95gui")
+    try:
+        cp = subprocess.run(
+            [script, action],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as e:
+        raise RuntimeError(f"GUI {action} failed: {e}") from e
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or "").strip() or f"exit {cp.returncode}"
+        raise RuntimeError(f"GUI {action} failed: {detail}")
+
+
+def _with_gui_stopped(op):
+    """Stop GUI, run op(), always try to start GUI again."""
+    _gui_service("stop")
+    # Match S95gui restart() delay so handles are released.
+    time.sleep(1)
+    try:
+        result = op()
+    except Exception:
+        try:
+            _gui_service("start")
+        except Exception:
+            pass
+        raise
+    try:
+        _gui_service("start")
+    except Exception as e:
+        raise RuntimeError(
+            f"operation completed but GUI start failed: {e}"
+        ) from e
+    return result
+
+
+@app.route('/logbook')
+def logbook():
+    return bottle.template('logbook')
+
+
+@app.get('/api/logbook/adi')
+def logbook_adi_list():
+    path = pathlib.Path(settings.FT_LOG_ADI_PATH)
+    bottle.response.content_type = 'application/json'
+    if not path.is_file():
+        return {"exists": False, "count": 0, "records": []}
+    try:
+        records = adif_parse.parse_adif_file(path)
+        records = adif_parse.records_newest_first(records)
+        return {"exists": True, "count": len(records), "records": records}
+    except Exception as e:
+        bottle.response.status = 500
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get('/api/logbook/adi/download')
+def logbook_adi_download():
+    path = pathlib.Path(settings.FT_LOG_ADI_PATH)
+    if not path.is_file():
+        bottle.abort(404, "ft_log.adi not found")
+    try:
+        os.sync()
+    except Exception:
+        pass
+    response = bottle.static_file(
+        path.name, root=str(path.parent), download=True)
+    response.set_header("Cache-Control", "no-store, no-cache, must-revalidate")
+    response.set_header("Pragma", "no-cache")
+    return response
+
+
+@app.post('/api/logbook/adi/upload')
+def logbook_adi_upload():
+    upload = bottle.request.files.get("file")
+    if upload is None:
+        bottle.response.status = 400
+        return {"status": "error", "msg": "file is required"}
+    name = pathlib.Path(upload.filename or "").name
+    if pathlib.Path(name).suffix.lower() != ".adi":
+        bottle.response.status = 400
+        return {"status": "error", "msg": "only .adi files are accepted"}
+    dest = pathlib.Path(settings.INCOMING_LOG_ADI_PATH)
+
+    def do_upload():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        upload.save(str(dest), overwrite=True)
+
+    try:
+        _with_gui_stopped(do_upload)
+    except Exception as e:
+        bottle.response.status = 500
+        return {"status": "error", "msg": str(e)}
+    return {
+        "status": "OK",
+        "msg": "Uploaded to /mnt/incoming_log.adi. GUI restarted to import into worked DB.",
+    }
+
+
+@app.delete('/api/logbook/adi')
+def logbook_adi_delete():
+    path = pathlib.Path(settings.FT_LOG_ADI_PATH)
+
+    def do_delete():
+        if path.is_file():
+            path.unlink()
+
+    try:
+        _with_gui_stopped(do_delete)
+    except Exception as e:
+        bottle.response.status = 500
+        return {"status": "error", "msg": str(e)}
+    return {
+        "status": "OK",
+        "msg": "Local ADI deleted. GUI restarted.",
+    }
+
+
+@app.post('/api/logbook/qsolog/reset')
+def logbook_qsolog_reset():
+    path = pathlib.Path(settings.QSO_LOG_DB_PATH)
+
+    def do_reset():
+        if not path.is_file():
+            return "missing"
+        con = sqlite3.connect(str(path))
+        try:
+            con.execute("DELETE FROM qso_log")
+            con.commit()
+        finally:
+            con.close()
+        return "cleared"
+
+    try:
+        result = _with_gui_stopped(do_reset)
+    except Exception as e:
+        bottle.response.status = 500
+        return {"status": "error", "msg": str(e)}
+    if result == "missing":
+        return {
+            "status": "OK",
+            "msg": "qsolog DB not present (already empty). GUI restarted.",
+        }
+    return {
+        "status": "OK",
+        "msg": "qsolog DB cleared. GUI restarted.",
+    }
 
 
 @app.get('/api/get_time')

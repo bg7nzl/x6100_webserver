@@ -5,3 +5,10 @@ FILEBROWSER_DEFAULT_START = ""
 # Use tmpfs; JPG written by GUI via stb_image_write, faster encode
 REMOTE_SCREEN_PATH = "/dev/shm/remote_screen.jpg"
 REMOTE_INPUT_PATH = "/tmp/x6100_remote_ctrl"
+
+# Logbook paths (DATA partition; same as x6100_gui)
+FT_LOG_ADI_PATH = "/mnt/ft_log.adi"
+INCOMING_LOG_ADI_PATH = "/mnt/incoming_log.adi"
+QSO_LOG_DB_PATH = "/mnt/qso_log.db"
+# Init script for stop/start around logbook mutations (does not affect boot autostart)
+GUI_INIT_SCRIPT = "/etc/init.d/S95gui"
