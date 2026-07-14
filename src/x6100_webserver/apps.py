@@ -1,12 +1,17 @@
 from datetime import datetime, timezone, timedelta
 from importlib import resources
+import hashlib
 import json
 import os
 import pathlib
+import re
+import shutil
 import sqlite3
 import subprocess
 import stat
+import tempfile
 import time
+import zipfile
 from urllib.parse import quote, urlparse
 
 import bottle
@@ -464,7 +469,7 @@ def time_editor():
 
 
 def _gui_service(action: str) -> None:
-    """Run S95gui start|stop. Runtime only; does not change boot autostart."""
+    """Run S95gui start|stop|restart. Runtime only; does not change boot autostart."""
     script = getattr(settings, "GUI_INIT_SCRIPT", "/etc/init.d/S95gui")
     try:
         cp = subprocess.run(
@@ -713,3 +718,175 @@ def set_timezone():
     except subprocess.CalledProcessError as e:
         bottle.response.status = 500
         return {"status": "error", "msg": f"Failed to set timezone: {str(e)}"}
+
+
+# GUI binary OTA
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class OtaValidationError(ValueError):
+    """Client-facing OTA package validation failure."""
+
+
+def _ota_max_bytes() -> int:
+    return int(getattr(settings, "GUI_OTA_MAX_BYTES", 32 * 1024 * 1024))
+
+
+def _ota_gui_bin_path() -> pathlib.Path:
+    return pathlib.Path(getattr(settings, "GUI_BIN_PATH", "/usr/sbin/x6100_gui"))
+
+
+def _fsync_file(path: pathlib.Path) -> None:
+    with open(path, "rb") as f:
+        os.fsync(f.fileno())
+
+
+def _fsync_dir(path: pathlib.Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _ota_extract_and_verify(
+    zip_path: pathlib.Path, work_dir: pathlib.Path
+) -> tuple[pathlib.Path, str]:
+    """Extract the single zip member and verify name == content sha256.
+
+    Returns (extracted_path, sha256_hex).
+    """
+    max_bytes = _ota_max_bytes()
+    try:
+        zf = zipfile.ZipFile(zip_path, "r")
+    except zipfile.BadZipFile as e:
+        raise OtaValidationError("not a valid zip file") from e
+
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) != 1:
+            raise OtaValidationError(
+                f"zip must contain exactly one file (found {len(infos)})"
+            )
+        info = infos[0]
+        name = info.filename
+        if "/" in name or "\\" in name or name in (".", ".."):
+            raise OtaValidationError("zip member name must be a bare filename")
+        if not _SHA256_HEX_RE.fullmatch(name):
+            raise OtaValidationError(
+                "zip member name must be a 64-char lowercase sha256 hex digest"
+            )
+        if info.file_size > max_bytes:
+            raise OtaValidationError(
+                f"payload exceeds max size ({max_bytes} bytes)"
+            )
+
+        out = work_dir / name
+        h = hashlib.sha256()
+        written = 0
+        with zf.open(info, "r") as src, open(out, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise OtaValidationError(
+                        f"payload exceeds max size ({max_bytes} bytes)"
+                    )
+                h.update(chunk)
+                dst.write(chunk)
+
+    digest = h.hexdigest()
+    if digest != name:
+        raise OtaValidationError(
+            "content sha256 does not match zip member filename"
+        )
+    return out, digest
+
+
+def _ota_install_gui_bin(src: pathlib.Path) -> None:
+    """Write src to GUI_BIN_PATH via temp file + os.replace; keep .bak copy."""
+    dest = _ota_gui_bin_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    new_path = dest.with_name(dest.name + ".new")
+    bak_path = dest.with_name(dest.name + ".bak")
+
+    shutil.copyfile(src, new_path)
+    os.chmod(new_path, 0o755)
+    _fsync_file(new_path)
+
+    if dest.is_file():
+        shutil.copyfile(dest, bak_path)
+        _fsync_file(bak_path)
+
+    os.replace(new_path, dest)
+    _fsync_dir(dest.parent)
+
+
+def _ota_apply_gui_zip(upload) -> str:
+    """Validate uploaded zip, install GUI binary. Returns sha256 hex.
+
+    Raises OtaValidationError on bad package; other Exception on I/O failure.
+    Does not restart GUI.
+    """
+    max_bytes = _ota_max_bytes()
+    work_dir = pathlib.Path(tempfile.mkdtemp(prefix="gui-ota-"))
+    zip_path = work_dir / "upload.zip"
+    try:
+        upload.save(str(zip_path), overwrite=True)
+        zip_size = zip_path.stat().st_size
+        if zip_size > max_bytes:
+            raise OtaValidationError(
+                f"upload exceeds max size ({max_bytes} bytes)"
+            )
+        if zip_size == 0:
+            raise OtaValidationError("empty upload")
+        extracted, digest = _ota_extract_and_verify(zip_path, work_dir)
+        _ota_install_gui_bin(extracted)
+        return digest
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/ota")
+def ota_page():
+    return bottle.template("ota")
+
+
+@app.post("/api/ota/gui")
+def ota_gui_upload():
+    upload = bottle.request.files.get("file")
+    if upload is None:
+        bottle.response.status = 400
+        return {"status": "error", "msg": "file is required"}
+
+    try:
+        digest = _ota_apply_gui_zip(upload)
+    except OtaValidationError as e:
+        bottle.response.status = 400
+        return {"status": "error", "msg": str(e)}
+    except Exception as e:
+        bottle.response.status = 500
+        return {"status": "error", "msg": str(e)}
+
+    try:
+        _gui_service("restart")
+    except Exception as e:
+        bottle.response.status = 500
+        return {
+            "status": "error",
+            "sha256": digest,
+            "msg": f"GUI binary replaced but restart failed: {e}",
+        }
+
+    return {
+        "status": "OK",
+        "sha256": digest,
+        "msg": "GUI updated and restarted.",
+    }

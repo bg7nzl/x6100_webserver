@@ -12,3 +12,6 @@ INCOMING_LOG_ADI_PATH = "/mnt/incoming_log.adi"
 QSO_LOG_DB_PATH = "/mnt/qso_log.db"
 # Init script for stop/start around logbook mutations (does not affect boot autostart)
 GUI_INIT_SCRIPT = "/etc/init.d/S95gui"
+# GUI binary OTA (zip with single member named as content sha256)
+GUI_BIN_PATH = "/usr/sbin/x6100_gui"
+GUI_OTA_MAX_BYTES = 32 * 1024 * 1024
