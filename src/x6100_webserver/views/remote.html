@@ -352,36 +352,85 @@
     screenStatusEl.textContent = msg;
   }
 
-  let refreshRetryCount = 0;
-  const REFRESH_MAX_RETRY = 1;
   let refreshInProgress = false;
+  let refreshPollTimer = null;
+  let screenObjectUrl = null;
+  const REFRESH_POLL_MS = 300;
+  const REFRESH_TIMEOUT_MS = 6000;
 
-  function refreshScreen(retrying) {
-    if (refreshInProgress) return;
-    refreshInProgress = true;
-    refreshRetryCount = retrying ? refreshRetryCount : 0;
-    const ts = Date.now();
-    setStatus(retrying ? 'Retrying…' : 'Refreshing…');
-    screenEl.src = `/api/remote_screen?ts=${ts}`;
+  function clearPollTimer() {
+    if (refreshPollTimer !== null) {
+      clearTimeout(refreshPollTimer);
+      refreshPollTimer = null;
+    }
   }
 
-  screenEl.addEventListener('load', () => {
-    setStatus('');
-    refreshRetryCount = 0;
-    refreshInProgress = false;
-  });
-  screenEl.addEventListener('error', () => {
-    if (refreshRetryCount < REFRESH_MAX_RETRY) {
-      refreshRetryCount += 1;
-      refreshInProgress = false;
-      setTimeout(() => refreshScreen(true), 1500);
-    } else {
-      setStatus('Not ready, click refresh again');
-      refreshRetryCount = 0;
-      refreshInProgress = false;
+  function showScreenBlob(blob) {
+    if (screenObjectUrl) {
+      URL.revokeObjectURL(screenObjectUrl);
+      screenObjectUrl = null;
     }
-  });
-  document.getElementById('refresh-screen').addEventListener('click', () => refreshScreen(false));
+    screenObjectUrl = URL.createObjectURL(blob);
+    screenEl.src = screenObjectUrl;
+    setStatus('');
+  }
+
+  function finishRefresh(ok, msg) {
+    clearPollTimer();
+    refreshInProgress = false;
+    if (!ok) setStatus(msg || 'Not ready, click refresh again');
+  }
+
+  async function pollScreen(token, deadline) {
+    if (Date.now() >= deadline) {
+      finishRefresh(false, 'Not ready, click refresh again');
+      return;
+    }
+    try {
+      const response = await fetch(`/api/remote_screen?time=${encodeURIComponent(token)}`);
+      if (response.status === 200) {
+        showScreenBlob(await response.blob());
+        finishRefresh(true);
+        return;
+      }
+      if (response.status === 202) {
+        const data = await response.json();
+        const nextToken = (data && data.time != null) ? data.time : token;
+        refreshPollTimer = setTimeout(() => pollScreen(nextToken, deadline), REFRESH_POLL_MS);
+        return;
+      }
+      finishRefresh(false, 'Failed to load screen');
+    } catch (e) {
+      finishRefresh(false, 'Failed to load screen');
+    }
+  }
+
+  async function refreshScreen() {
+    if (refreshInProgress) return;
+    refreshInProgress = true;
+    clearPollTimer();
+    setStatus('Refreshing…');
+    try {
+      const response = await fetch('/api/remote_screen');
+      if (response.status !== 202) {
+        finishRefresh(false, 'Failed to request screen');
+        return;
+      }
+      const data = await response.json();
+      if (!data || data.time == null) {
+        finishRefresh(false, 'Failed to request screen');
+        return;
+      }
+      refreshPollTimer = setTimeout(
+        () => pollScreen(data.time, Date.now() + REFRESH_TIMEOUT_MS),
+        REFRESH_POLL_MS
+      );
+    } catch (e) {
+      finishRefresh(false, 'Failed to request screen');
+    }
+  }
+
+  document.getElementById('refresh-screen').addEventListener('click', refreshScreen);
 
   let autoRefreshIntervalId = null;
 
@@ -395,7 +444,7 @@
     if (value === 'none') return;
     const ms = parseInt(value, 10) * 1000;
     if (ms > 0) {
-      autoRefreshIntervalId = setInterval(() => refreshScreen(false), ms);
+      autoRefreshIntervalId = setInterval(refreshScreen, ms);
     }
   }
 
@@ -410,7 +459,7 @@
         body: JSON.stringify(payload)
       });
       if (refreshOnButton) {
-        setTimeout(() => refreshScreen(false), 400);
+        setTimeout(refreshScreen, 400);
       }
     } catch (e) {
       console.error(e);

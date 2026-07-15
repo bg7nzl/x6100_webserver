@@ -365,49 +365,56 @@ def dmesg_view():
     return bottle.template('dmesg', lines=lines, error=error)
 
 
+REMOTE_SCREEN_REQ_PATH = "/tmp/remote_screen.req"
+
+
+def _serve_screen(jpg):
+    resp = bottle.static_file(jpg.name, root=str(jpg.parent))
+    resp.set_header("Content-Type", "image/jpeg")
+    resp.set_header("Cache-Control", "no-store, no-cache, must-revalidate")
+    resp.set_header("Pragma", "no-cache")
+    return resp
+
+
 @app.get('/api/remote_screen')
 def remote_screen():
-    # Signal GUI to capture a screenshot on-demand.
-    req_path = pathlib.Path("/tmp/remote_screen.req")
+    # Async handshake via req mtime as the only shared token:
+    # - no param: touch when idle, else join pending capture; always return 202 {time}
+    # - ?time=: return JPEG when jpg.mtime > token, else 202 {time}
+    jpg = pathlib.Path(settings.REMOTE_SCREEN_PATH)
     try:
-        req_path.touch()
-    except Exception:
-        pass
-
-    # Best-effort wait: the screenshot is produced asynchronously.
-    # Since refresh is manual, it's OK to wait a short time here.
-    try:
-        req_mtime = req_path.stat().st_mtime
-    except Exception:
-        req_mtime = None
-
-    path = pathlib.Path(settings.REMOTE_SCREEN_PATH)
-    # 800x480 encode is slow on device; wait longer to reduce 503
-    deadline = time.monotonic() + 2.5
-    while time.monotonic() < deadline:
-        try:
-            st = path.stat()
-            if st.st_size > 0 and (req_mtime is None or st.st_mtime >= req_mtime):
-                break
-        except FileNotFoundError:
-            pass
-        time.sleep(0.05)
-    # Only serve if we have a screenshot that was updated after this request.
-    # Otherwise we would return the previous screenshot when the GUI is slow.
-    try:
-        st = path.stat()
-        if st.st_size == 0 or (req_mtime is not None and st.st_mtime < req_mtime):
-            bottle.response.status = 503
-            return {"status": "error", "msg": "screen not ready, please try again"}
+        jpg_st = jpg.stat()
+        jpg_mtime = jpg_st.st_mtime if jpg_st.st_size > 0 else 0.0
     except FileNotFoundError:
-        bottle.response.status = 404
-        return {"status": "error", "msg": "screen not ready"}
+        jpg_mtime = 0.0
 
-    response = bottle.static_file(path.name, root=str(path.parent))
-    response.set_header("Content-Type", "image/jpeg")
-    response.set_header("Cache-Control", "no-store, no-cache, must-revalidate")
-    response.set_header("Pragma", "no-cache")
-    return response
+    time_arg = bottle.request.query.get('time')
+    if time_arg:
+        try:
+            token = float(time_arg)
+        except ValueError:
+            bottle.response.status = 400
+            return {"status": "error", "msg": "invalid time"}
+        if token < jpg_mtime:
+            return _serve_screen(jpg)
+        bottle.response.status = 202
+        return {"status": "pending", "time": token}
+
+    # no param: trigger when idle (incl. first run), else join the pending capture
+    req = pathlib.Path(REMOTE_SCREEN_REQ_PATH)
+    try:
+        req_mtime = req.stat().st_mtime
+    except FileNotFoundError:
+        req_mtime = 0.0
+    if req_mtime <= jpg_mtime:
+        try:
+            req.touch()
+            req_mtime = req.stat().st_mtime
+        except Exception as e:
+            bottle.response.status = 500
+            return {"status": "error", "msg": str(e)}
+    bottle.response.status = 202
+    return {"status": "pending", "time": req_mtime}
 
 
 def _write_remote_command(line):
