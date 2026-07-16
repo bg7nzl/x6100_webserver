@@ -17,6 +17,7 @@ from urllib.parse import quote, urlparse
 import bottle
 
 from . import adif_parse
+from . import ft8_state
 from . import models
 from . import settings
 
@@ -345,6 +346,26 @@ def save_txt(filepath=""):
 @app.route('/remote')
 def remote():
     return bottle.template('remote')
+
+
+@app.route('/ft8')
+def ft8_page():
+    return bottle.template('ft8')
+
+
+@app.get('/api/ft8/state')
+def ft8_state_api():
+    return ft8_state.to_dict(settings.FT8_STATE_PATH)
+
+
+@app.post('/api/ft8/command')
+def ft8_command():
+    data = bottle.request.json or {}
+    line, err = ft8_state.build_command_line(data.get("verb"), data.get("arg"))
+    if err:
+        bottle.response.status = 400
+        return {"status": "error", "msg": err}
+    return _write_remote_command(line)
 
 
 @app.route('/dmesg')
