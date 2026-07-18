@@ -9,7 +9,7 @@ import struct
 import time
 
 FT8_REMOTE_MAGIC = 0x46543852
-FT8_REMOTE_VERSION = 2
+FT8_REMOTE_VERSION = 3
 FT8_REMOTE_MAX_ROWS = 512
 
 _ROW_FMT = "<II BBBBB 3x hhhh 40s 16s 8s"
@@ -20,12 +20,13 @@ _STATE_HDR_FMT = (
     "x"
     "hhhh"
     "24s 16s 16s 32s 16s 8s 64s"
+    "BBHHhI"
     "H H"
 )
 _STATE_HDR_SIZE = struct.calcsize(_STATE_HDR_FMT)
 _STATE_SIZE = _STATE_HDR_SIZE + FT8_REMOTE_MAX_ROWS * _ROW_SIZE
 
-assert _ROW_SIZE == 88 and _STATE_HDR_SIZE == 212
+assert _ROW_SIZE == 88 and _STATE_HDR_SIZE == 224
 
 
 def _pad(s: str, n: int) -> bytes:
@@ -91,6 +92,12 @@ def pack_state(
     de_call: str = "BG7NZL",
     de_grid: str = "OL72",
     status: str = "Next TX: CQ BG7NZL OL72",
+    autodnf_valid: int = 0,
+    autodnf_applied: int = 0,
+    autodnf_center_hz: int = 0,
+    autodnf_half_width_hz: int = 35,
+    autodnf_delta_db: int = 0,
+    autodnf_time_utc: int = 0,
     rows: list[bytes] | None = None,
     seq: int = 2,
 ) -> bytes:
@@ -124,6 +131,12 @@ def pack_state(
         _pad(de_call, 16),
         _pad(de_grid, 8),
         _pad(status, 64),
+        autodnf_valid,
+        autodnf_applied,
+        autodnf_center_hz,
+        autodnf_half_width_hz,
+        autodnf_delta_db,
+        autodnf_time_utc,
         row_count,
         FT8_REMOTE_MAX_ROWS,
     )

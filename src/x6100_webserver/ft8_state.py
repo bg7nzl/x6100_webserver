@@ -1,6 +1,6 @@
 """FT8 remote structured-state shm reader + command whitelist.
 
-Binary layout mirrors x6100_gui ft8_remote.h (FT8_REMOTE_VERSION=2).
+Binary layout mirrors x6100_gui ft8_remote.h (FT8_REMOTE_VERSION=3).
 """
 
 from __future__ import annotations
@@ -16,20 +16,21 @@ from . import settings
 
 FT8_STATE_PATH = getattr(settings, "FT8_STATE_PATH", "/dev/shm/x6100_ft8_state")
 FT8_REMOTE_MAGIC = 0x46543852  # 'FT8R'
-FT8_REMOTE_VERSION = 2
+FT8_REMOTE_VERSION = 3
 FT8_REMOTE_MAX_ROWS = 512
 
 # ft8_remote_row_t — 88 bytes
 _ROW_FMT = "<II BBBBB 3x hhhh 40s 16s 8s"
 _ROW_SIZE = struct.calcsize(_ROW_FMT)
 
-# Header before rows[] — 212 bytes (incl. 1-byte implicit pad after tx_active)
+# Header before rows[] — 224 bytes (incl. 1-byte implicit pad after tx_active)
 _STATE_HDR_FMT = (
     "<I H H I"  # magic, version, _pad0, seq
     "11B"  # active..tx_active
     "x"  # implicit padding before int16
     "hhhh"  # tx_delta_hz, filter_low, filter_high, _pad1
     "24s 16s 16s 32s 16s 8s 64s"  # strings
+    "BBHHhI"  # autodnf_valid..autodnf_time_utc
     "H H"  # row_count, row_capacity
 )
 _STATE_HDR_SIZE = struct.calcsize(_STATE_HDR_FMT)
@@ -37,7 +38,7 @@ _ROWS_OFFSET = _STATE_HDR_SIZE
 _STATE_SIZE = _ROWS_OFFSET + FT8_REMOTE_MAX_ROWS * _ROW_SIZE
 _SEQ_OFFSET = 8
 
-assert _ROW_SIZE == 88 and _STATE_HDR_SIZE == 212, "ft8_remote.h layout drift"
+assert _ROW_SIZE == 88 and _STATE_HDR_SIZE == 224, "ft8_remote.h layout drift"
 
 _PROTOCOL = {0: "FT4", 1: "FT8"}
 _CQ_STATE = {0: "OFF", 1: "EVEN", 2: "ODD"}
@@ -239,6 +240,12 @@ def to_dict(path: Optional[str] = None) -> dict[str, Any]:
         de_call,
         de_grid,
         status,
+        autodnf_valid,
+        autodnf_applied,
+        autodnf_center_hz,
+        autodnf_half_width_hz,
+        autodnf_delta_db,
+        autodnf_time_utc,
         row_count,
         row_capacity,
     ) = hdr
@@ -256,6 +263,16 @@ def to_dict(path: Optional[str] = None) -> dict[str, Any]:
         row = _parse_row(buf[off : off + _ROW_SIZE])
         if row is not None:
             rows.append(row)
+
+    autodnf = None
+    if autodnf_valid:
+        autodnf = {
+            "time": int(autodnf_time_utc),
+            "center_hz": int(autodnf_center_hz),
+            "half_width_hz": int(autodnf_half_width_hz),
+            "delta_db": int(autodnf_delta_db),
+            "applied": bool(autodnf_applied),
+        }
 
     server_time_ms = int(time.time() * 1000)
     return {
@@ -279,6 +296,7 @@ def to_dict(path: Optional[str] = None) -> dict[str, Any]:
         "de_call": _cstr(de_call),
         "de_grid": _cstr(de_grid),
         "status": _cstr(status),
+        "autodnf": autodnf,
         "server_time_ms": server_time_ms,
         "slot": _slot_info(proto_name, server_time_ms),
         "row_count": len(rows),

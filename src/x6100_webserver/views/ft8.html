@@ -74,7 +74,7 @@
 
   .ft8-lists { margin-bottom: 0.8rem; }
   .ft8-table-wrap {
-    border: 1px solid #ccc; border-radius: 6px; overflow: auto; max-height: 420px;
+    border: 1px solid #ccc; border-radius: 6px;
   }
   .ft8-table-wrap h3 { margin: 0; padding: 0.4rem 0.6rem; background: #f5f5f5; font-size: 0.95rem; }
   table.ft8-tbl { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
@@ -178,8 +178,13 @@
         <label for="free-msg">Free MSG</label>
         <input type="text" id="free-msg" maxlength="13">
       </div>
-      <button type="button" class="ft8-btn" id="btn-freemsg">Set FREEMSG</button>
+      <button type="button" class="ft8-btn" id="btn-freemsg">Send Free MSG</button>
     </div>
+  </div>
+
+  <div class="ft8-waterfall">
+    <h3>Slot waterfall (last 6 · 0–3000 Hz)</h3>
+    <canvas id="ft8-waterfall-canvas" width="900" height="420"></canvas>
   </div>
 
   <div class="ft8-lists">
@@ -195,11 +200,6 @@
       </table>
     </div>
   </div>
-
-  <div class="ft8-waterfall">
-    <h3>Slot waterfall (last 6 · 0–3000 Hz)</h3>
-    <canvas id="ft8-waterfall-canvas" width="900" height="420"></canvas>
-  </div>
 </div>
 
 <script>
@@ -210,8 +210,10 @@
   const ctx = canvas.getContext('2d');
 
   let pollTimer = null;
-  /** @type {Array<{key:number, tx:boolean, txDelta:number, txCall:string, signals:Array, protocol:string}>} */
+  /** @type {Array<{key:number, tx:boolean, txDelta:number, txCall:string, signals:Array, protocol:string, autodnf:object|null}>} */
   let slotBuffer = [];
+  /** @type {Map<number, {center_hz:number, half_width_hz:number, delta_db:number, applied:boolean}>} */
+  let autodnfBySlot = new Map();
   let lastState = null;
   let pageHidden = false;
 
@@ -262,9 +264,10 @@
   }
 
   function fillTable(tbody, rows, protocol) {
+    // Newest first (shm snapshot is chronological).
     tbody.innerHTML = rows.filter(function (r) {
       return r.type !== 'START_QSO';
-    }).map(function (r) { return rowHtml(r, protocol); }).join('');
+    }).slice().reverse().map(function (r) { return rowHtml(r, protocol); }).join('');
   }
 
   function snrToColor(snr) {
@@ -279,6 +282,16 @@
 
   function bwHz(protocol) {
     return protocol === 'FT4' ? 83 : 50;
+  }
+
+  /**
+   * ft8lib freq_hz / remote delta_hz is the tone-0 base frequency (start),
+   * not the band center — see gen_ft8.c "symbol 0 (base frequency)" and
+   * monitor.c candidate span [freq_offset, freq_offset+7].
+   * Autodnf peak is PSD energy center; draw decode/TX cells at base + bw/2.
+   */
+  function signalCenterHz(baseHz, protocol) {
+    return Number(baseHz) + bwHz(protocol) / 2;
   }
 
   /** Own call for TX cells on the waterfall. */
@@ -302,7 +315,8 @@
           txDelta: state.tx_delta_hz || 0,
           txCall: '',
           signals: [],
-          protocol: protocol
+          protocol: protocol,
+          autodnf: null
         };
         map.set(key, slot);
       }
@@ -320,9 +334,55 @@
         });
       }
     });
-    slotBuffer = Array.from(map.values()).sort(function (a, b) {
-      return b.key - a.key;
-    }).slice(0, 6);
+
+    // Remember autodnf markers by slot (shm only keeps the latest event).
+    if (state.autodnf && state.autodnf.time != null) {
+      const dnfKey = slotStartOf(state.autodnf.time, protocol);
+      autodnfBySlot.set(dnfKey, {
+        center_hz: state.autodnf.center_hz || 0,
+        half_width_hz: state.autodnf.half_width_hz || 35,
+        delta_db: state.autodnf.delta_db || 0,
+        applied: !!state.autodnf.applied
+      });
+    }
+
+    // Anchor to the newest list row's slot — not wall clock (current slot may have no decodes yet).
+    const period = periodSec(protocol);
+    let anchor = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i];
+      if (r.type === 'START_QSO') continue;
+      anchor = slotStartOf(r.time, protocol);
+      break;
+    }
+    if (anchor == null) {
+      slotBuffer = [];
+      drawWaterfall();
+      return;
+    }
+    slotBuffer = [];
+    const keepKeys = new Set();
+    for (let i = 0; i < 6; i++) {
+      const key = anchor - i * period;
+      keepKeys.add(key);
+      let slot = map.get(key);
+      if (!slot) {
+        slot = {
+          key: key,
+          tx: false,
+          txDelta: state.tx_delta_hz || 0,
+          txCall: '',
+          signals: [],
+          protocol: protocol,
+          autodnf: null
+        };
+      }
+      slot.autodnf = autodnfBySlot.get(key) || null;
+      slotBuffer.push(slot);
+    }
+    autodnfBySlot.forEach(function (_v, k) {
+      if (!keepKeys.has(k)) autodnfBySlot.delete(k);
+    });
     drawWaterfall();
   }
 
@@ -349,6 +409,30 @@
     ctx.fillStyle = '#fff';
     ctx.fillText(call, 0, 0);
     ctx.restore();
+  }
+
+  function drawAutodnf(slot, y0, rowH, w, hzMax) {
+    const d = slot.autodnf;
+    if (!d) return;
+    const color = d.applied ? '#e53935' : '#1565c0';
+    const half = d.half_width_hz || 35;
+    const leftHz = Math.max(0, d.center_hz - half);
+    const rightHz = Math.min(hzMax, d.center_hz + half);
+    const xL = (leftHz / hzMax) * w;
+    const xR = (rightHz / hzMax) * w;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(xL, y0 + 2);
+    ctx.lineTo(xL, y0 + rowH - 2);
+    ctx.moveTo(xR, y0 + 2);
+    ctx.lineTo(xR, y0 + rowH - 2);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.font = 'bold 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('+ ' + d.delta_db + ' dB', Math.min(xL, xR) + 3, y0 + 3);
   }
 
   function drawWaterfall() {
@@ -381,13 +465,14 @@
       const toneW = (bwHz(slot.protocol) / hzMax) * w;
       const cellW = Math.max(minCellW, toneW);
       slot.signals.forEach(function (s) {
-        const x = (s.delta_hz / hzMax) * w;
+        const x = (signalCenterHz(s.delta_hz, slot.protocol) / hzMax) * w;
         drawSignalCell(x, y, cellW, cellDrawH, snrToColor(s.snr_db), s.call);
       });
       if (slot.tx) {
-        const x = (slot.txDelta / hzMax) * w;
+        const x = (signalCenterHz(slot.txDelta, slot.protocol) / hzMax) * w;
         drawSignalCell(x, y, cellW, cellDrawH, '#e53935', slot.txCall || 'TX');
       }
+      drawAutodnf(slot, y0, rowH, w, hzMax);
     }
     // Hz ticks
     ctx.fillStyle = '#888';
@@ -472,7 +557,9 @@
 
   function scheduleNext(state) {
     clearPoll();
-    if (pageHidden) return;
+    // Keep polling even when the tab is hidden — autodnf is only the latest
+    // event in shm; pausing here skips slots and breaks the waterfall markers.
+    // if (pageHidden) return;
     let delay;
     if (!state || !state.active) {
       delay = 2500;
@@ -533,14 +620,14 @@
     sendCommand('CLICK', tr.getAttribute('data-id'));
   });
 
-  document.addEventListener('visibilitychange', function () {
-    pageHidden = document.hidden;
-    if (pageHidden) {
-      clearPoll();
-    } else {
-      fetchState(false);
-    }
-  });
+  // document.addEventListener('visibilitychange', function () {
+  //   pageHidden = document.hidden;
+  //   if (pageHidden) {
+  //     clearPoll();
+  //   } else {
+  //     fetchState(false);
+  //   }
+  // });
 
   drawWaterfall();
   fetchState(false);
