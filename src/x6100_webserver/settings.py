@@ -1,8 +1,8 @@
-# 文件浏览根目录；空或 "/" 表示可浏览到 /，并可「..」到 /
+# File browser root; empty or "/" allows browsing from /, including ".." up to /
 FILEBROWSER_PATH = ""
-# 默认起始目录（相对 root）：打开 /files/ 时先进入该目录，如 "mnt" 表示默认 /mnt
+# Default start dir relative to root (e.g. "mnt" -> /mnt); empty stays at root
 FILEBROWSER_DEFAULT_START = ""
-# Use tmpfs; JPG written by GUI via stb_image_write, faster encode
+# Use tmpfs; JPG written by GUI via libjpeg
 REMOTE_SCREEN_PATH = "/dev/shm/remote_screen.jpg"
 REMOTE_INPUT_PATH = "/tmp/x6100_remote_ctrl"
 # FT8 structured state shm (GUI ft8_remote.c writes; webserver read-only)

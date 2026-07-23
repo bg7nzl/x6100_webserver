@@ -56,12 +56,12 @@ def _filebrowser_root() -> pathlib.Path:
 
 
 def _filebrowser_default_start() -> str:
-    """相对 root 的默认起始目录，空表示直接显示 root。"""
-    return getattr(settings, "FILEBROWSER_DEFAULT_START", "mnt") or ""
+    """Default start dir relative to root; empty shows root directly."""
+    return settings.FILEBROWSER_DEFAULT_START or ""
 
 
 def _resolve_filebrowser_path(filepath: str) -> pathlib.Path:
-    rel = (filepath or "").lstrip("/")
+    rel = filepath.lstrip("/")
     root = _filebrowser_root()
     try:
         candidate = (root / rel).resolve()
@@ -186,103 +186,27 @@ def digital_modes():
     return bottle.template('digital_modes')
 
 
-@app.route('/files')
-@app.route('/files/')
-@app.route('/files/<filepath:path>')
-@app.route('/files/<filepath:path>/')
-def files(filepath=""):
-    root = _filebrowser_root()
-    path = _resolve_filebrowser_path(filepath)
-    # 默认起始目录：在根且未从子目录点「..」进来时，重定向到 /mnt
-    default_start = _filebrowser_default_start()
-    if default_start and path == root:
-        ref = bottle.request.get_header("Referer")
-        ref_path = urlparse(ref).path if ref else ""
-        # 来自 /files/xxx/ 表示点了「..」到根，不重定向
-        from_root = ref_path.startswith("/files/") and ref_path.rstrip("/").count("/") >= 2
-        if not from_root:
-            return bottle.redirect(f"/files/{_url_quote_path(default_start)}/")
-    if path.is_file():
-        os.sync()
-        response = bottle.static_file(
-            str(path.relative_to(root)),
-            root=str(root),
-            download=True,
-        )
-        response.set_header("Cache-Control", "private, no-cache, no-store")
-        return response
-
-    if not path.exists():
-        bottle.abort(404, "not found")
-    if not path.is_dir():
-        bottle.abort(404, "not found")
-
-    try:
-        rel_dir = path.relative_to(root)
-    except Exception:
-        rel_dir = pathlib.Path("")
-
-    # 上一层：不在根目录时显示 ..
-    has_parent = str(rel_dir) not in ("", ".")
-    parent_path = ""
-    if has_parent:
-        parent_rel = rel_dir.parent
-        parent_path = "" if str(parent_rel) == "." else parent_rel.as_posix()
-
-    dirs = []
-    files = []
-    try:
-        for item in sorted(path.iterdir()):
-            item_rel = item.relative_to(root).as_posix()
-            entry = {"name": item.name, "path": item_rel, "path_url": _url_quote_path(item_rel)}
-            if item.is_dir():
-                dirs.append(entry)
-            else:
-                files.append(entry)
-    except PermissionError:
-        bottle.abort(403, "forbidden")
-
-    return bottle.template(
-        'files',
-        has_parent=has_parent,
-        parent_path=parent_path,
-        parent_path_url=_url_quote_path(parent_path),
-        dirs=dirs,
-        files=files,
-    )
-
-
-@app.route('/raw/<filepath:path>')
-def file_raw(filepath=""):
-    root = _filebrowser_root()
-    path = _resolve_filebrowser_path(filepath)
-    if not path.exists() or not path.is_file():
-        bottle.abort(404, "not found")
+def _serve_filebrowser_file(root: pathlib.Path, path: pathlib.Path, *, download: bool):
+    os.sync()
     response = bottle.static_file(
         str(path.relative_to(root)),
         root=str(root),
-        download=False,
+        download=download,
     )
     response.set_header("Cache-Control", "private, no-cache, no-store")
     return response
 
 
-@app.route('/view/<filepath:path>')
-def file_view(filepath=""):
-    path = _resolve_filebrowser_path(filepath)
-    if not path.exists():
-        bottle.abort(404, "not found")
-    if path.is_dir():
-        return bottle.redirect(f"/files/{_url_quote_path(filepath)}/")
-
+def _file_view_page(filepath: str, path: pathlib.Path):
     suffix = path.suffix.lower()
+    quoted = _url_quote_path(filepath)
     if suffix in _IMAGE_EXTS:
         return bottle.template(
             'file_view',
             filepath=filepath,
-            filepath_url=_url_quote_path(filepath),
+            filepath_url=quoted,
             is_image=True,
-            image_url=f"/raw/{_url_quote_path(filepath)}",
+            image_url=f"/files/{quoted}?raw",
             text_content="",
             truncated=False,
             is_txt_editable=False,
@@ -305,13 +229,88 @@ def file_view(filepath=""):
     return bottle.template(
         'file_view',
         filepath=filepath,
-        filepath_url=_url_quote_path(filepath),
+        filepath_url=quoted,
         is_image=False,
         image_url="",
         text_content=text_content,
         truncated=truncated,
         is_txt_editable=is_txt_editable,
     )
+
+
+@app.route('/files')
+@app.route('/files/')
+@app.route('/files/<filepath:path>')
+@app.route('/files/<filepath:path>/')
+def files(filepath=""):
+    root = _filebrowser_root()
+    path = _resolve_filebrowser_path(filepath)
+    # Default start: at root, redirect unless the user navigated up via ".."
+    default_start = _filebrowser_default_start()
+    if default_start and path == root:
+        ref = bottle.request.get_header("Referer")
+        ref_path = urlparse(ref).path if ref else ""
+        # Referer /files/xxx/ means ".." to root — do not redirect away
+        from_root = ref_path.startswith("/files/") and ref_path.rstrip("/").count("/") >= 2
+        if not from_root:
+            return bottle.redirect(f"/files/{_url_quote_path(default_start)}/")
+
+    want_view = "view" in bottle.request.query
+    want_raw = "raw" in bottle.request.query
+
+    if path.is_file():
+        if want_view:
+            return _file_view_page(filepath, path)
+        return _serve_filebrowser_file(root, path, download=not want_raw)
+
+    if not path.exists():
+        bottle.abort(404, "not found")
+    if not path.is_dir():
+        bottle.abort(404, "not found")
+
+    try:
+        rel_dir = path.relative_to(root)
+    except Exception:
+        rel_dir = pathlib.Path("")
+
+    # Parent link: show ".." when not at root
+    has_parent = str(rel_dir) not in ("", ".")
+    parent_path = ""
+    if has_parent:
+        parent_rel = rel_dir.parent
+        parent_path = "" if str(parent_rel) == "." else parent_rel.as_posix()
+
+    dirs = []
+    files_list = []
+    try:
+        for item in sorted(path.iterdir()):
+            item_rel = item.relative_to(root).as_posix()
+            entry = {"name": item.name, "path": item_rel, "path_url": _url_quote_path(item_rel)}
+            if item.is_dir():
+                dirs.append(entry)
+            else:
+                files_list.append(entry)
+    except PermissionError:
+        bottle.abort(403, "forbidden")
+
+    return bottle.template(
+        'files',
+        has_parent=has_parent,
+        parent_path=parent_path,
+        parent_path_url=_url_quote_path(parent_path),
+        dirs=dirs,
+        files=files_list,
+    )
+
+
+@app.route('/raw/<filepath:path>')
+def file_raw_redirect(filepath=""):
+    return bottle.redirect(f"/files/{_url_quote_path(filepath)}?raw")
+
+
+@app.route('/view/<filepath:path>')
+def file_view_redirect(filepath=""):
+    return bottle.redirect(f"/files/{_url_quote_path(filepath)}?view")
 
 
 @app.post('/api/save_txt/<filepath:path>')
